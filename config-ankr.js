@@ -31,7 +31,7 @@ module.exports = {
             'wss://bsc.publicnode.com'
         ],
         // UPDATED: New contract address
-        contractAddress: '0x7EE57D1616B654614B8D334b90dFD9EeA07a3e00',
+        contractAddress: '0x4Ce5eff760652BcCAcF69f3e3cB152A5DC872AA4',
         usdtContractAddress: '0x55d398326f99059fF775485246999027B3197955',
         chainId: 56,
         networkName: 'BSC Mainnet'
