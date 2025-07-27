@@ -11,27 +11,19 @@ module.exports = {
 
     // Ankr Blockchain Configuration
     blockchain: {
-        // Primary Ankr RPC (with load balancing)
+        // Ankr-only RPC endpoints
         rpcUrls: [
             `https://rpc.ankr.com/bsc/${process.env.ANKR_API_KEY || '41be6db3daba53f8161018ac9400564296e448b8b1b9efdfc88e0ab7c2570bf6'}`,
-            'https://bsc-dataseed.binance.org/',
-            'https://bsc-dataseed1.defibit.io/'
-        ],
-        // Fallback to additional public endpoints
-        fallbackRpcUrls: [
-            'https://bsc-dataseed2.defibit.io/',
-            'https://bsc-dataseed3.defibit.io/',
-            'https://bsc-dataseed4.defibit.io/',
             'https://rpc.ankr.com/bsc'
         ],
-        // WebSocket endpoints for real-time event monitoring
-        wsUrls: [
-            'wss://rpc.ankr.com/bsc/ws/41be6db3daba53f8161018ac9400564296e448b8b1b9efdfc88e0ab7c2570bf6',
-            'wss://bsc-ws-node.nariox.org:443',
-            'wss://bsc.publicnode.com'
+        // Ankr fallback endpoints
+        fallbackRpcUrls: [
+            'https://rpc.ankr.com/bsc'
         ],
+        // Ankr WebSocket endpoints (disabled due to reliability)
+        wsUrls: [],
         // UPDATED: New contract address
-        contractAddress: '0x4Ce5eff760652BcCAcF69f3e3cB152A5DC872AA4',
+        contractAddress: '0xe20b7F0AC2bc61dFA03A23280Caf60D0133134e0',
         usdtContractAddress: '0x55d398326f99059fF775485246999027B3197955',
         chainId: 56,
         networkName: 'BSC Mainnet'
@@ -54,15 +46,15 @@ module.exports = {
         enableBonusNotifications: false, // Disabled - only show joins and rejoins
         enableStatistics: false, // Disabled to reduce API calls
         
-        // WebSocket Configuration (Primary method)
-        enableWebSocket: true,
+        // WebSocket Configuration (Disabled due to reliability issues)
+        enableWebSocket: false,
         wsReconnectDelay: 5000, // 5 seconds reconnect delay
-        wsMaxReconnectAttempts: 10,
+        wsMaxReconnectAttempts: 3, // Reduced to fail faster
         wsHeartbeatInterval: 30000, // 30 seconds ping/pong
         
-        // Polling Configuration (Fallback method)
-        checkIntervalSeconds: 30, // 30 seconds to conserve API credits
-        maxBlockRange: 100, // Smaller range for efficiency
+        // Polling Configuration (Primary method)
+        checkIntervalSeconds: 5, // 5 seconds for better event detection
+        maxBlockRange: 500, // Optimized range for Ankr
         batchDelay: 1000, // 1 second delay between batches
         retryDelay: 2000, // 2 second retry delay
         maxRetries: 5, // Increased retry attempts

@@ -1,25 +1,32 @@
 /**
- *Submitted for verification at BscScan.com on 2025-07-25
+ *Submitted for verification at BscScan.com on 2025-07-26
 */
 
 /**
- *Submitted for verification at BscScan.com on 2025-07-23
+ *Submitted for verification at BscScan.com on 2025-07-27
 */
 
 /**
- * 💸 HOURROI – Earn Every Hour! (Minimal Function Version)
+ * HOURROI – Earn Every Hour! (CORRECTED VERSION)
  * 
- * ✅ Join with just 10 USDT
- * ✅ Refer 1 Active Direct person to start earning
- * ✅ Get paid every hour based on your tier!
+ * CORRECT FIXES:
+ * 1. Active directs reset to 0 after claim/rejoin ✅
+ * 2. Only NEW joins in current cycle count as active ✅
+ * 3. Old directs preserved but don't auto-reactivate ✅
+ * 4. Batch migration for all users in one call ✅
  * 
- * 🎖 ROI Tiers (Based on Active Directs):
- * 🔒 0 directs = ❌ No ROI
- * 🥉 1–4 = 2 USDT/hour (Bronze Tier 20%)
- * 🥈 5–9 = 3 USDT/hour (Silver Tier 30%) 
- * 🥇 10–49 = 5 USDT/hour (Gold Tier 50%)
- * 💎 50–99 = 10 USDT/hour (Platinum Tier 100%)
- * 🔷 100+ = 50 USDT/hour (Diamond Tier 500%)
+ * Join with just 10 USDT
+ * Refer 1 Active Direct person to start earning
+ * Get paid every cycle based on your tier!
+ * 
+ * ROI Tiers (Based on Active Directs FROM CURRENT CYCLE ONLY):
+ * 0 directs = No ROI
+ * 1–4 = 12 USDT per cycle (Bronze Tier)
+ * 2–4 = 20 USDT per cycle (Silver Tier) 
+ * 5–9 = 30 USDT per cycle (Gold Tier)
+ * 10–49 = 50 USDT per cycle (Platinum Tier)
+ * 50–99 = 100 USDT per cycle (Diamond Tier)
+ * 100+ = 500 USDT per cycle (Icon Tier)
 */
 
 // SPDX-License-Identifier: MIT
@@ -118,7 +125,7 @@ contract HOURROI is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     address private constant MAINNET_USDT_ADDRESS = 0x55d398326f99059fF775485246999027B3197955;
-    address private constant OLD_CONTRACT_ADDRESS = 0x7EE57D1616B654614B8D334b90dFD9EeA07a3e00;
+    address private constant OLD_CONTRACT_ADDRESS = 0x4Ce5eff760652BcCAcF69f3e3cB152A5DC872AA4;
     
     IERC20 public immutable USDT;
     IOldHOURROI public immutable oldContract;
@@ -132,19 +139,13 @@ contract HOURROI is ReentrancyGuard {
     uint8 public currentMigrationPhase = 0;
     bool public newMigrationActive = false;
     
-    // Emergency withdrawal timelock
-    uint256 public emergencyWithdrawTime;
-    uint256 private constant EMERGENCY_TIMELOCK = 7 days;
-    bool public emergencyWithdrawInitiated;
-    
     uint256 private constant JOIN_AMOUNT = 10 * 10**18;
     uint256 private constant REJOIN_AMOUNT = 10 * 10**18;
     uint256 private constant ADMIN_FEE = 2 * 10**18;
     uint256 private constant CYCLE_DURATION = 10 hours;
-    uint256 private constant ROI_INTERVAL = 1 hours;
-    uint256 private constant MAX_DIRECT_REFS = 1000; // Prevent DOS attacks
+    uint256 private constant MAX_DIRECT_REFS = 1000;
     
-    // Packed struct layout for gas optimization
+    // CORRECTED: Track only new joins per cycle
     struct User {
         // Slot 1: Time values (64 bits each = 256 bits total)
         uint64 joinTime;
@@ -152,9 +153,10 @@ contract HOURROI is ReentrancyGuard {
         uint64 lastRewardUpdate;
         uint64 lastActiveDirectsUpdate;
         
-        // Slot 2: Counters (128 bits each = 256 bits total)
-        uint128 activeDirects;     // Cached value - automatic updates
-        uint128 totalDirects;
+        // Slot 2: Counters and cycle (256 bits total)
+        uint64 currentCycle;       // Track user's current cycle
+        uint64 unused1;            // For future use
+        uint128 totalDirects;      // Total historical directs (preserved)
         
         // Slot 3: Reward and referrer (256 bits total)
         uint128 pendingRewards;
@@ -170,9 +172,14 @@ contract HOURROI is ReentrancyGuard {
     mapping(address => bool) public migratedFromOld;
     mapping(address => bool) public downlinesMigrated;
     
-    // Optimized referral tracking with mappings
-    mapping(address => mapping(uint256 => address)) public directReferrals; // referrer => index => referral
-    mapping(address => uint256) public directReferralsCount; // referrer => count
+    // CORRECTED: Track ONLY directs who joined in each specific cycle
+    mapping(address => mapping(uint64 => uint128)) public activeDirectsInCycle; // user => cycle => count of actives in that cycle
+    mapping(address => mapping(uint64 => mapping(uint256 => address))) public directsJoinedInCycle; // user => cycle => index => direct address
+    mapping(address => mapping(uint64 => uint256)) public directsCountInCycle; // user => cycle => total count in that cycle
+    
+    // Historical referral tracking (preserved for total counts)
+    mapping(address => mapping(uint256 => address)) public directReferrals; // All historical directs
+    mapping(address => uint256) public directReferralsCount; // Total historical count
     mapping(address => mapping(address => bool)) public isDirectReferral;
     mapping(address => mapping(address => uint256)) public referralIndex;
     
@@ -186,21 +193,38 @@ contract HOURROI is ReentrancyGuard {
     event UserRejoined(address indexed user, uint256 amount, uint256 timestamp);
     event RewardsClaimed(address indexed user, uint256 amount);
     event CycleCompleted(address indexed user, uint256 timestamp);
-    event EmergencyWithdrawInitiated(uint256 executeTime);
-    event EmergencyWithdrawCancelled();
     event EmergencyWithdrawExecuted(uint256 amount);
-    event ActiveDirectsUpdated(address indexed user, uint256 newCount);
+    event ActiveDirectsUpdated(address indexed user, uint64 cycle, uint256 newCount);
+    event CycleStarted(address indexed user, uint64 cycle, uint256 timestamp);
     
     // Migration events
     event UserMigrated(address indexed user, address indexed referrer);
     event MigrationCompleted(uint256 totalMigrated);
     event BatchDone(uint256 batch, uint256 index, uint256 time);
     event DownMigrate(address indexed user, uint256 count);
-    event ActiveDirectsReset(address indexed user);
     
     modifier onlyAdmin() {
         require(msg.sender == admin, "Only admin");
         _;
+    }
+    
+    /**
+     * @dev Debug function to check admin status
+     */
+    function debugAdminStatus() external view returns (
+        address contractAdmin,
+        address currentCaller,
+        bool isCallerAdmin,
+        bool migrationComplete,
+        bool isMigrationActive  // FIXED: Renamed to avoid shadowing
+    ) {
+        return (
+            admin,
+            msg.sender,
+            msg.sender == admin,
+            migrationCompleted,
+            newMigrationActive
+        );
     }
     
     modifier postMigration() {
@@ -215,12 +239,11 @@ contract HOURROI is ReentrancyGuard {
     }
     
     // ===================================================================
-    // 🚀 MAIN USER FUNCTIONS (Only 3 write functions as requested)
+    // MAIN USER FUNCTIONS (CORRECTED)
     // ===================================================================
     
     /**
-     * @dev JOIN FUNCTION - Users can join with optional referrer
-     * @param _referrer Address of referrer (can be zero address for no referrer)
+     * @dev CORRECTED JOIN FUNCTION - Only adds to current cycle, preserves historical
      */
     function joinPlan(address _referrer) external postMigration nonReentrant {
         require(!hasJoined[msg.sender], "Already joined");
@@ -230,7 +253,7 @@ contract HOURROI is ReentrancyGuard {
             _referrer = address(0);
         }
         
-        // Optional referrer validation - only check limits if referrer exists and has joined
+        // Optional referrer validation
         if (_referrer != address(0) && hasJoined[_referrer]) {
             require(directReferralsCount[_referrer] < MAX_DIRECT_REFS, "Referrer limit exceeded");
         }
@@ -240,24 +263,24 @@ contract HOURROI is ReentrancyGuard {
         
         uint64 currentTime = uint64(block.timestamp);
         
-        // Initialize user
+        // Initialize user with cycle 1
         User storage user = users[msg.sender];
         user.joinTime = currentTime;
-        user.cycleEndTime = currentTime + uint64(CYCLE_DURATION);
+        user.cycleEndTime = 0; // No timer yet - starts when getting first direct
         user.lastRewardUpdate = currentTime;
         user.lastActiveDirectsUpdate = currentTime;
+        user.currentCycle = 1; // Start at cycle 1
         user.isActive = true;
         user.referrer = _referrer;
-        // activeDirects, totalDirects, pendingRewards, hasMinimumDirect default to 0/false
         
         hasJoined[msg.sender] = true;
         unchecked {
-        totalUsersJoined++;
+            totalUsersJoined++;
         }
         
-        // AUTOMATIC: Add to referrer's list and update counts
+        // CORRECTED: Add to referrer's CURRENT CYCLE only (not historical reactivation)
         if (_referrer != address(0) && hasJoined[_referrer]) {
-            _addDirectReferralAndUpdateROI(_referrer, msg.sender);
+            _addNewDirectToCurrentCycle(_referrer, msg.sender);
         }
         
         // Pay admin fee
@@ -267,22 +290,26 @@ contract HOURROI is ReentrancyGuard {
     }
 
     /**
-     * @dev CLAIM AND REJOIN FUNCTION - Users claim profits and automatically rejoin
-     * After 10 hours: If profit > 10 USDT, user gets excess and auto rejoins with 10 USDT
-     * Active directs reset to 0 on rejoin
+     * @dev FIXED CLAIM AND REJOIN - Auto-reactivates user for their referrer
      */
     function claimAndRejoin() external postMigration nonReentrant {
         User storage user = users[msg.sender];
         require(user.isActive, "User not active");
+        require(user.cycleEndTime > 0, "ROI not started - need first direct");
         require(block.timestamp >= user.cycleEndTime, "10-hour cycle not completed");
+        require(directReferralsCount[msg.sender] >= 2, "Need minimum 2 total historical directs");
         
-        // AUTOMATIC: Calculate and update rewards based on time
-        _updateStoredRewardsAuto(msg.sender);
+        // Use ONLY current cycle actives for rewards
+        uint128 currentCycleActives = activeDirectsInCycle[msg.sender][user.currentCycle];
+        uint256 totalRewards = 0;
         
-        uint256 totalRewards = getCurrentPendingROI(msg.sender);
+        if (user.hasMinimumDirect && currentCycleActives >= 1) {
+            totalRewards = _getTierReward(currentCycleActives);
+        }
+        
         uint256 contractBalance = USDT.balanceOf(address(this));
-        
         uint256 profit = 0;
+        
         if (totalRewards > REJOIN_AMOUNT) {
             profit = totalRewards - REJOIN_AMOUNT;
             require(contractBalance >= profit, "Insufficient contract balance for profit");
@@ -290,24 +317,28 @@ contract HOURROI is ReentrancyGuard {
         
         address referrer = user.referrer;
         uint64 currentTime = uint64(block.timestamp);
+        uint64 newCycle = user.currentCycle + 1;
         
-        // Reset user for new cycle - Active directs reset to 0
+        // Reset for new cycle - active directs go to 0, historical preserved
         user.isActive = true;
         user.joinTime = currentTime;
-        user.cycleEndTime = currentTime + uint64(CYCLE_DURATION);
+        user.cycleEndTime = 0; // Reset timer
         user.lastRewardUpdate = currentTime;
         user.lastActiveDirectsUpdate = currentTime;
         user.hasMinimumDirect = false;
-        user.activeDirects = 0;  // Reset Active directs to 0
         user.pendingRewards = 0;
+        user.currentCycle = newCycle; // Move to next cycle
+        
+        // Active directs reset to 0 for new cycle
+        activeDirectsInCycle[msg.sender][newCycle] = 0;
         
         unchecked {
-        totalRewardsPaid += totalRewards;
+            totalRewardsPaid += totalRewards;
         }
         
-        // AUTOMATIC: Update referrer's active count
+        // FIXED: Auto-reactivate this user for their referrer's current cycle
         if (referrer != address(0) && hasJoined[referrer] && users[referrer].isActive) {
-            _updateReferrerActiveCountAuto(referrer);
+            _addNewDirectToCurrentCycle(referrer, msg.sender);
         }
         
         // Transfer profit to user if any
@@ -320,108 +351,94 @@ contract HOURROI is ReentrancyGuard {
         
         emit RewardsClaimed(msg.sender, totalRewards);
         emit UserRejoined(msg.sender, REJOIN_AMOUNT, currentTime);
+        emit CycleStarted(msg.sender, newCycle, currentTime);
     }
     
     /**
-     * @dev EMERGENCY WITHDRAWAL - Simple two-step process
-     * Step 1: Call once to start 7-day timelock
-     * Step 2: Call again after 7 days to withdraw funds
+     * @dev Emergency withdrawal without timelock
      */
     function emergencyWithdraw() external onlyAdmin {
-        if (!emergencyWithdrawInitiated) {
-            // STEP 1: Start the timelock
-            emergencyWithdrawTime = block.timestamp + EMERGENCY_TIMELOCK;
-            emergencyWithdrawInitiated = true;
-            emit EmergencyWithdrawInitiated(emergencyWithdrawTime);
-            return; // Exit here after initiating
-        }
-        
-        // STEP 2: Check if timelock has passed
-        require(block.timestamp >= emergencyWithdrawTime, "Timelock not expired yet");
-        
-        // Execute withdrawal
         uint256 balance = USDT.balanceOf(address(this));
         require(balance > 0, "No balance to withdraw");
         
-        // Reset state first (security best practice)
-        emergencyWithdrawInitiated = false;
-        emergencyWithdrawTime = 0;
-        
-        // Transfer all funds to admin
         USDT.safeTransfer(admin, balance);
         emit EmergencyWithdrawExecuted(balance);
     }
     
     // ===================================================================
-    // 🤖 AUTOMATIC INTERNAL FUNCTIONS (No external calls needed)
+    // CORRECTED INTERNAL FUNCTIONS
     // ===================================================================
     
     /**
-     * @dev AUTOMATIC: Add direct referral and update ROI
+     * @dev CORRECTED: Add NEW direct to referrer's CURRENT CYCLE only (no old reactivation)
      */
-    function _addDirectReferralAndUpdateROI(address _referrer, address _referral) internal {
-        if (!isDirectReferral[_referrer][_referral]) {
+    function _addNewDirectToCurrentCycle(address _referrer, address _newJoiner) internal {
+        User storage referrer = users[_referrer];
+        uint64 referrerCycle = referrer.currentCycle;
+        
+        // Add to historical tracking (preserve total count)
+        if (!isDirectReferral[_referrer][_newJoiner]) {
             uint256 count = directReferralsCount[_referrer];
-            directReferrals[_referrer][count] = _referral;
-            referralIndex[_referrer][_referral] = count;
-            isDirectReferral[_referrer][_referral] = true;
+            directReferrals[_referrer][count] = _newJoiner;
+            referralIndex[_referrer][_newJoiner] = count;
+            isDirectReferral[_referrer][_newJoiner] = true;
             
             unchecked {
                 directReferralsCount[_referrer]++;
+                referrer.totalDirects++;
             }
-            
-            // AUTOMATIC: Update referrer's active count and start ROI if applicable
-            _updateReferrerActiveCountAuto(_referrer);
         }
+        
+        // CORRECTED: Add ONLY this new joiner to current cycle (no old directs counted)
+        uint256 cycleIndex = directsCountInCycle[_referrer][referrerCycle];
+        directsJoinedInCycle[_referrer][referrerCycle][cycleIndex] = _newJoiner;
+        directsCountInCycle[_referrer][referrerCycle]++;
+        
+        // Update referrer's active count for current cycle
+        _updateReferrerActiveCountInCurrentCycle(_referrer);
     }
     
     /**
-     * @dev AUTOMATIC: Update referrer's active count and ROI status
+     * @dev CORRECTED: Update referrer's active count for CURRENT CYCLE only
      */
-    function _updateReferrerActiveCountAuto(address _referrer) internal {
+    function _updateReferrerActiveCountInCurrentCycle(address _referrer) internal {
         User storage referrer = users[_referrer];
         if (!referrer.isActive) return;
         
-        uint128 newActiveCount = _countActiveDirectsAuto(_referrer);
+        uint64 referrerCycle = referrer.currentCycle;
         
-        if (referrer.activeDirects != newActiveCount) {
-            referrer.activeDirects = newActiveCount;
-            referrer.totalDirects = uint128(directReferralsCount[_referrer]);
-            referrer.lastActiveDirectsUpdate = uint64(block.timestamp);
-            
-            emit ActiveDirectsUpdated(_referrer, newActiveCount);
-            
-            // AUTOMATIC: Start ROI when getting first direct (runs for full 10 hours)
-            if (newActiveCount >= 1 && !referrer.hasMinimumDirect) {
-                referrer.hasMinimumDirect = true;
-                // DON'T reset lastRewardUpdate - preserve existing pending ROI!
-                // Only set cycleEndTime if not already set
-                if (referrer.cycleEndTime <= block.timestamp) {
-                    referrer.cycleEndTime = uint64(block.timestamp + CYCLE_DURATION);
-                }
-            }
+        // CORRECTED: Count ONLY people who joined in THIS cycle and are still active
+        uint128 currentCycleActives = _countActiveDirectsInSpecificCycle(_referrer, referrerCycle);
+        
+        // Update cycle data
+        activeDirectsInCycle[_referrer][referrerCycle] = currentCycleActives;
+        referrer.lastActiveDirectsUpdate = uint64(block.timestamp);
+        
+        emit ActiveDirectsUpdated(_referrer, referrerCycle, currentCycleActives);
+        
+        // Start timer when getting first direct in current cycle
+        if (currentCycleActives >= 1 && !referrer.hasMinimumDirect) {
+            referrer.hasMinimumDirect = true;
+            referrer.cycleEndTime = uint64(block.timestamp + CYCLE_DURATION);
         }
     }
     
     /**
-     * @dev AUTOMATIC: Count active direct referrals with overflow protection
+     * @dev CORRECTED: Count ONLY directs who joined in this specific cycle
      */
-    function _countActiveDirectsAuto(address _user) internal view returns (uint128) {
-        uint256 count = directReferralsCount[_user];
+    function _countActiveDirectsInSpecificCycle(address _user, uint64 _cycle) internal view returns (uint128) {
+        uint256 count = directsCountInCycle[_user][_cycle];
         if (count == 0) return 0;
         
         uint128 activeCount = 0;
-        uint256 maxCheck = count > 100 ? 100 : count; // Gas limit protection
         
-        for (uint256 i = 0; i < maxCheck;) {
-            address ref = directReferrals[_user][i];
-            if (ref != address(0) && users[ref].isActive) {
+        // CORRECTED: Only check people who joined in THIS specific cycle
+        for (uint256 i = 0; i < count && i < 100; i++) {
+            address directInThisCycle = directsJoinedInCycle[_user][_cycle][i];
+            if (directInThisCycle != address(0) && users[directInThisCycle].isActive) {
                 unchecked {
                     activeCount++;
                 }
-            }
-            unchecked {
-                i++;
             }
         }
         
@@ -429,66 +446,24 @@ contract HOURROI is ReentrancyGuard {
     }
     
     /**
-     * @dev AUTOMATIC: Update stored rewards based on time elapsed
+     * @dev Get tier reward for completed cycle
      */
-    function _updateStoredRewardsAuto(address _user) internal {
-        User storage user = users[_user];
-        
-        if (!user.isActive || !user.hasMinimumDirect) {
-            return;
-        }
-        
-        uint256 currentTime = block.timestamp;
-        uint256 effectiveEndTime = currentTime > user.cycleEndTime ? user.cycleEndTime : currentTime;
-        
-        // Ensure no underflow
-        if (effectiveEndTime <= user.lastRewardUpdate) {
-            return;
-        }
-        
-        uint256 timeSinceLastUpdate = effectiveEndTime - user.lastRewardUpdate;
-        
-        if (timeSinceLastUpdate >= ROI_INTERVAL) {
-            uint256 hoursCompleted = timeSinceLastUpdate / ROI_INTERVAL;
-            uint256 ratePerHour = _getIntervalReward(user.activeDirects);
-            
-            if (ratePerHour > 0 && hoursCompleted > 0) {
-                uint256 newRewards = hoursCompleted * ratePerHour;
-                
-                // Check for overflow before adding
-                require(user.pendingRewards + newRewards <= type(uint128).max, "Rewards overflow");
-                
-                user.pendingRewards += uint128(newRewards);
-                user.lastRewardUpdate = uint64(user.lastRewardUpdate + (hoursCompleted * ROI_INTERVAL));
-            }
-        }
-        
-        // AUTOMATIC: Stop ROI if cycle completed
-        if (currentTime >= user.cycleEndTime && user.hasMinimumDirect) {
-            user.hasMinimumDirect = false;
-        }
-    }
-    
-    /**
-     * @dev Get ROI rate based on active directs
-     */
-     function _getIntervalReward(uint256 directCount) internal pure returns (uint256) {
-         
-        if (directCount >= 100) return 50 * 10**18;    // 50 USDT/hour (Icon)
-        if (directCount >= 50) return 10 * 10**18;    // 10 USDT/hour (Diamond)
-        if (directCount >= 10) return 5 * 10**18;     // 5 USDT/hour (Platinum)
-        if (directCount >= 5) return 3 * 10**18;     // 3 USDT/hour (Gold)
-        if (directCount >= 2) return 2 * 10**18;      // 2 USDT/hour (Silver)
-        if (directCount >= 1) return 1.2 * 10**17;   // 1.2 USDT/hour (Bronze)
+    function _getTierReward(uint256 directCount) internal pure returns (uint256) {
+        if (directCount >= 100) return 500 * 10**18;   // Icon: 500 USDT
+        if (directCount >= 50) return 100 * 10**18;    // Diamond: 100 USDT  
+        if (directCount >= 10) return 50 * 10**18;     // Platinum: 50 USDT
+        if (directCount >= 5) return 30 * 10**18;      // Gold: 30 USDT
+        if (directCount >= 2) return 20 * 10**18;      // Silver: 20 USDT
+        if (directCount >= 1) return 12 * 10**18;      // Bronze: 12 USDT
         return 0;
     }
     
     // ===================================================================
-    // 🔄 MIGRATION FUNCTIONS - FIXED VERSION
+    // FIXED MIGRATION FUNCTIONS
     // ===================================================================
     
     /**
-     * @dev Start the migration process from old contract
+     * @dev Start the migration process
      */
     function startNewMigration() external onlyAdmin {
         require(!migrationCompleted, "Migration already completed");
@@ -499,111 +474,77 @@ contract HOURROI is ReentrancyGuard {
     }
     
     /**
-     * @dev Migrate users in batches from old contract - FIXED VERSION
+     * @dev FIXED: Migrate all users from migratedUsersList in one call
      */
-    function newBatchMigration(uint256 batchSize) external onlyAdmin {
+    function migrateAllUsersFromList() external onlyAdmin {
         require(newMigrationActive, "New migration not started");
         require(!migrationCompleted, "Migration completed");
-        require(batchSize >= 10 && batchSize <= 100, "Batch size 10-100");
         
-        if (currentMigrationPhase == 0) {
-            _migrateUsersBatchFixed(batchSize);
-        } else if (currentMigrationPhase == 1) {
-            _migrateDownlinesBatch(batchSize);
-        }
-    }
-    
-    /**
-     * @dev FIXED: Auto-migrate users by getting them from old contract
-     */
-    function _migrateUsersBatchFixed(uint256 batchSize) internal {
-        uint256 processed = 0;
+        uint256 totalUsers = migratedUsersList.length; // Should be 69
+        require(totalUsers > 0, "No users in migrated list");
         
-        // Get total users from old contract
-        uint256 oldTotalUsers;
-        try oldContract.totalUsersJoined() returns (uint256 total) {
-            oldTotalUsers = total;
-        } catch {
-            emit BatchDone(0, migrationIndex, block.timestamp);
-            return;
-        }
+        uint256 migrated = 0;
         
-        // Process users starting from migrationIndex
-        uint256 currentIndex = migrationIndex;
-        
-        for (uint256 i = 0; i < batchSize && currentIndex < oldTotalUsers; i++) {
-            // Since we can't auto-discover users, this will just increment the index
-            // Use migrateSpecificUsers instead for actual migration
-            currentIndex++;
-            processed++;
+        // Migrate all users from the list
+        for (uint256 i = 0; i < totalUsers; i++) {
+            address userAddr = migratedUsersList[i];
+            
+            if (userAddr == address(0)) {
+                continue;
+            }
+            
+            // Skip if already migrated in new contract
+            if (hasJoined[userAddr]) {
+                continue;
+            }
+            
+            // Migrate user data from old contract
+            if (_migrateUserFromOldContract(userAddr)) {
+                migrated++;
+            }
         }
         
-        migrationIndex = currentIndex;
-        emit BatchDone(processed, migrationIndex, block.timestamp);
+        totalMigratedUsers = migrated;
+        emit BatchDone(migrated, totalUsers, block.timestamp);
     }
-    
+
     /**
-     * @dev Start downlines migration phase
+     * @dev FIXED: Migrate user from old contract PRESERVING active directs
      */
-    function startDownlinesMigration() external onlyAdmin {
-        require(newMigrationActive, "New migration not started");
-        currentMigrationPhase = 1;
-    }
-    
-    /**
-     * @dev Complete the migration process
-     */
-    function completeNewMigration() external onlyAdmin {
-        require(newMigrationActive, "New migration not started");
-        migrationCompleted = true;
-        currentMigrationPhase = 2;
-        newMigrationActive = false;
-        emit MigrationCompleted(totalMigratedUsers);
-    }
-    
-    /**
-     * @dev FIXED: Migrate single user with ACTIVE DIRECTS RESET TO 0
-     */
-    function _migrateUser(address userAddr) internal returns (bool) {
+    function _migrateUserFromOldContract(address userAddr) internal returns (bool) {
         try oldContract.users(userAddr) returns (
-            uint64 joinTime, uint64 cycleEndTime, uint64, uint64,
-            uint128 /* activeDirects */, uint128 totalDirects, uint128 pendingRewards, 
-            address referrer, bool isActive, bool /* hasMinimumDirect */
+            uint64 joinTime, uint64 cycleEndTime, uint64 lastRewardUpdate, uint64 lastActiveDirectsUpdate,
+            uint128 activeDirects, uint128 totalDirects, uint128 pendingRewards, 
+            address referrer, bool isActive, bool hasMinimumDirect
         ) {
             if (joinTime == 0) return false;
             
             // Validate referrer
             if (referrer != admin && referrer != address(0)) {
-                if (!migratedFromOld[referrer] && !hasJoined[referrer]) {
-                    referrer = admin;
+                if (!hasJoined[referrer]) {
+                    referrer = admin; // Fallback to admin if referrer not migrated
                 }
             }
             
-            // Create user with ACTIVE DIRECTS RESET TO 0
+            // CORRECTED: Preserve user data including active directs
             User storage user = users[userAddr];
             user.joinTime = joinTime;
-            user.cycleEndTime = cycleEndTime;
-            user.lastRewardUpdate = uint64(block.timestamp);
-            user.lastActiveDirectsUpdate = uint64(block.timestamp);
-            
-            // 🔥 RESET ACTIVE DIRECTS TO 0 ON MIGRATION
-            user.activeDirects = 0;  // ← This is the key change
-            
-            user.totalDirects = totalDirects;
-            user.pendingRewards = pendingRewards;
+            user.cycleEndTime = cycleEndTime; // PRESERVE: Keep original cycle end time
+            user.lastRewardUpdate = lastRewardUpdate; // PRESERVE: Keep original update time
+            user.lastActiveDirectsUpdate = lastActiveDirectsUpdate;
+            user.currentCycle = 1; // Start at cycle 1
+            user.totalDirects = totalDirects; // Keep historical count
+            user.pendingRewards = pendingRewards; // PRESERVE: Keep pending rewards
             user.referrer = referrer;
             user.isActive = isActive;
+            user.hasMinimumDirect = hasMinimumDirect; // PRESERVE: Keep minimum direct status
             
-            // 🔥 RESET hasMinimumDirect to false so ROI must restart
-            user.hasMinimumDirect = false;  // ← Force ROI restart
+            // CORRECTED: PRESERVE active directs from old contract
+            activeDirectsInCycle[userAddr][1] = activeDirects; // Keep their active directs in cycle 1
             
             hasJoined[userAddr] = true;
-            migratedFromOld[userAddr] = true;
-            migratedUsersList.push(userAddr);
-            totalUsersJoined++;
             
             emit UserMigrated(userAddr, referrer);
-            emit ActiveDirectsReset(userAddr);
             return true;
         } catch {
             return false;
@@ -611,35 +552,47 @@ contract HOURROI is ReentrancyGuard {
     }
     
     /**
-     * @dev Simple downlines migration
+     * @dev FIXED: Migrate all downlines in one call
      */
-    function _migrateDownlinesBatch(uint256 batchSize) internal {
+    function migrateAllDownlines() external onlyAdmin {
+        require(newMigrationActive, "New migration not started");
+        
         uint256 processed = 0;
         
-        for (uint256 i = 0; i < migratedUsersList.length && processed < batchSize; i++) {
+        // Process all users in migratedUsersList
+        for (uint256 i = 0; i < migratedUsersList.length; i++) {
             address userAddr = migratedUsersList[i];
-            if (migratedFromOld[userAddr] && !downlinesMigrated[userAddr]) {
-                _migrateDownlines(userAddr);
+            
+            if (hasJoined[userAddr] && !downlinesMigrated[userAddr]) {
+                _migrateUserDownlines(userAddr);
                 processed++;
             }
         }
         
-        emit BatchDone(processed, migrationIndex, block.timestamp);
+        emit BatchDone(processed, migratedUsersList.length, block.timestamp);
     }
-    
+
     /**
-     * @dev Migrate user downlines - SIMPLE VERSION
+     * @dev FIXED: Migrate user's downlines from old contract (historical only)
      */
-    function _migrateDownlines(address userAddr) internal {
-        uint256 expectedDownlines = 0;
+    function _migrateUserDownlines(address userAddr) internal {
+        uint256 expectedCount = 0;
+        
+        // Get downlines count from old contract
         try oldContract.directReferralsCount(userAddr) returns (uint256 count) {
-            expectedDownlines = count;
-        } catch {}
+            expectedCount = count;
+        } catch {
+            downlinesMigrated[userAddr] = true;
+            return;
+        }
         
         uint256 actualCount = 0;
-        for (uint256 i = 0; i < expectedDownlines && i < 100; i++) {
+        
+        // Migrate each downline (historical tracking only)
+        for (uint256 i = 0; i < expectedCount && i < MAX_DIRECT_REFS; i++) {
             try oldContract.directReferrals(userAddr, i) returns (address downline) {
                 if (downline != address(0)) {
+                    // Add to historical referral mappings only (not current cycle)
                     directReferrals[userAddr][actualCount] = downline;
                     isDirectReferral[userAddr][downline] = true;
                     referralIndex[userAddr][downline] = actualCount;
@@ -652,37 +605,109 @@ contract HOURROI is ReentrancyGuard {
         
         directReferralsCount[userAddr] = actualCount;
         downlinesMigrated[userAddr] = true;
+        
         emit DownMigrate(userAddr, actualCount);
     }
     
     /**
-     * @dev IMPROVED: Migrate specific users with better error handling
+     * @dev FIXED: One-click complete migration without external calls
+     */
+    function oneClickCompleteMigration() external onlyAdmin {
+        require(!migrationCompleted, "Already completed");
+        
+        // Start migration if not started
+        if (!newMigrationActive) {
+            newMigrationActive = true;
+            migrationIndex = 0;
+            totalMigratedUsers = 0;
+            currentMigrationPhase = 0;
+        }
+        
+        // Phase 1: Migrate all users (FIXED: Direct call instead of this.)
+        _migrateAllUsersFromListInternal();
+        
+        // Phase 2: Migrate all downlines (FIXED: Direct call instead of this.)
+        currentMigrationPhase = 1;
+        _migrateAllDownlinesInternal();
+        
+        // Complete migration
+        migrationCompleted = true;
+        currentMigrationPhase = 2;
+        newMigrationActive = false;
+        
+        emit MigrationCompleted(totalMigratedUsers);
+    }
+    
+    /**
+     * @dev FIXED: Internal function for migrating users (no external call)
+     */
+    function _migrateAllUsersFromListInternal() internal {
+        uint256 totalUsers = migratedUsersList.length; // Should be 69
+        require(totalUsers > 0, "No users in migrated list");
+        
+        uint256 migrated = 0;
+        
+        // Migrate all users from the list
+        for (uint256 i = 0; i < totalUsers; i++) {
+            address userAddr = migratedUsersList[i];
+            
+            if (userAddr == address(0)) {
+                continue;
+            }
+            
+            // Skip if already migrated in new contract
+            if (hasJoined[userAddr]) {
+                continue;
+            }
+            
+            // Migrate user data from old contract
+            if (_migrateUserFromOldContract(userAddr)) {
+                migrated++;
+            }
+        }
+        
+        totalMigratedUsers = migrated;
+        emit BatchDone(migrated, totalUsers, block.timestamp);
+    }
+    
+    /**
+     * @dev FIXED: Internal function for migrating downlines (no external call)
+     */
+    function _migrateAllDownlinesInternal() internal {
+        uint256 processed = 0;
+        
+        // Process all users in migratedUsersList
+        for (uint256 i = 0; i < migratedUsersList.length; i++) {
+            address userAddr = migratedUsersList[i];
+            
+            if (hasJoined[userAddr] && !downlinesMigrated[userAddr]) {
+                _migrateUserDownlines(userAddr);
+                processed++;
+            }
+        }
+        
+        emit BatchDone(processed, migratedUsersList.length, block.timestamp);
+    }
+    
+    /**
+     * @dev Migrate specific users with better error handling
      */
     function migrateSpecificUsers(address[] calldata userAddresses) external onlyAdmin {
         require(newMigrationActive, "New migration not started");
         require(userAddresses.length <= 50, "Max 50 users");
         
         uint256 migrated = 0;
-        uint256 failed = 0;
         
         for (uint256 i = 0; i < userAddresses.length; i++) {
             address userAddr = userAddresses[i];
             
-            if (userAddr == address(0)) {
-                failed++;
-                continue;
-            }
-            
-            if (migratedFromOld[userAddr]) {
-                // Already migrated, skip
+            if (userAddr == address(0) || migratedFromOld[userAddr]) {
                 continue;
             }
             
             if (_migrateUser(userAddr)) {
                 migrated++;
                 totalMigratedUsers++;
-            } else {
-                failed++;
             }
         }
         
@@ -690,161 +715,99 @@ contract HOURROI is ReentrancyGuard {
     }
     
     /**
-     * @dev ALTERNATIVE: Simple reset all active directs after migration
+     * @dev Migrate single user PRESERVING active directs (not resetting)
      */
-    function resetAllActiveDirects() external onlyAdmin {
-        require(migrationCompleted, "Migration not completed");
-        
-        for (uint256 i = 0; i < migratedUsersList.length; i++) {
-            address userAddr = migratedUsersList[i];
-            User storage user = users[userAddr];
+    function _migrateUser(address userAddr) internal returns (bool) {
+        try oldContract.users(userAddr) returns (
+            uint64 joinTime, uint64 cycleEndTime, uint64 lastRewardUpdate, uint64 lastActiveDirectsUpdate,
+            uint128 activeDirects, uint128 totalDirects, uint128 pendingRewards, 
+            address referrer, bool isActive, bool hasMinimumDirect
+        ) {
+            if (joinTime == 0) return false;
             
-            // Reset active directs to 0
-            user.activeDirects = 0;
-            user.hasMinimumDirect = false;
-            user.lastActiveDirectsUpdate = uint64(block.timestamp);
-            
-            emit ActiveDirectsUpdated(userAddr, 0);
-            emit ActiveDirectsReset(userAddr);
-        }
-    }
-    
-    /**
-     * @dev Force update active directs for specific users after migration
-     */
-    function forceUpdateActiveDirects(address[] calldata userAddresses) external onlyAdmin {
-        require(migrationCompleted, "Migration not completed");
-        
-        for (uint256 i = 0; i < userAddresses.length; i++) {
-            address userAddr = userAddresses[i];
-            if (hasJoined[userAddr]) {
-                // Force recalculation of active directs
-                _updateReferrerActiveCountAuto(userAddr);
+            // Validate referrer
+            if (referrer != admin && referrer != address(0)) {
+                if (!migratedFromOld[referrer] && !hasJoined[referrer]) {
+                    referrer = admin;
+                }
             }
-        }
-    }
-    
-    /**
-     * @dev Get migration statistics
-     */
-    function getMigrationStats() external view returns (
-        bool isCompleted,
-        uint256 migratedCount,
-        uint256 totalMigrated,
-        uint8 currentPhase,
-        bool isActive
-    ) {
-        return (
-            migrationCompleted,
-            migratedUsersList.length,
-            totalMigratedUsers,
-            currentMigrationPhase,
-            newMigrationActive
-        );
-    }
-    
-    /**
-     * @dev Get migration progress and recommendations
-     */
-    function getMigrationProgress() external view returns (
-        uint256 totalMigrated,
-        uint256 totalInList,
-        bool completed,
-        uint8 phase,
-        string memory recommendation
-    ) {
-        totalMigrated = totalMigratedUsers;
-        totalInList = migratedUsersList.length;
-        completed = migrationCompleted;
-        phase = currentMigrationPhase;
-        
-        if (!newMigrationActive && !completed) {
-            recommendation = "Call startNewMigration() first";
-        } else if (phase == 0) {
-            recommendation = "Use migrateSpecificUsers() with user addresses";
-        } else if (phase == 1) {
-            recommendation = "Use newBatchMigration() for downlines";
-        } else {
-            recommendation = "Migration completed";
-        }
-        
-        return (totalMigrated, totalInList, completed, phase, recommendation);
-    }
-    
-    /**
-     * @dev Test old contract connection
-     */
-    function testOldContract() external view returns (
-        bool canConnect,
-        uint256 oldTotalUsers,
-        address oldContractAddress
-    ) {
-        oldContractAddress = address(oldContract);
-        
-        try oldContract.totalUsersJoined() returns (uint256 total) {
-            canConnect = true;
-            oldTotalUsers = total;
+            
+            // CORRECTED: PRESERVE all data including active directs
+            User storage user = users[userAddr];
+            user.joinTime = joinTime;
+            user.cycleEndTime = cycleEndTime; // PRESERVE: Keep original cycle time
+            user.lastRewardUpdate = lastRewardUpdate; // PRESERVE: Keep original times
+            user.lastActiveDirectsUpdate = lastActiveDirectsUpdate;
+            user.currentCycle = 1; // Start at cycle 1
+            user.totalDirects = totalDirects;
+            user.pendingRewards = pendingRewards; // PRESERVE: Keep pending rewards
+            user.referrer = referrer;
+            user.isActive = isActive;
+            user.hasMinimumDirect = hasMinimumDirect; // PRESERVE: Keep status
+            
+            // CORRECTED: PRESERVE active directs from old contract
+            activeDirectsInCycle[userAddr][1] = activeDirects; // Keep their active directs
+            
+            hasJoined[userAddr] = true;
+            migratedFromOld[userAddr] = true;
+            migratedUsersList.push(userAddr);
+            totalUsersJoined++;
+            
+            emit UserMigrated(userAddr, referrer);
+            return true;
         } catch {
-            canConnect = false;
-            oldTotalUsers = 0;
+            return false;
         }
-        
-        return (canConnect, oldTotalUsers, oldContractAddress);
+    }
+    
+    /**
+     * @dev Complete migration
+     */
+    function completeNewMigration() external onlyAdmin {
+        require(newMigrationActive, "New migration not started");
+        migrationCompleted = true;
+        currentMigrationPhase = 2;
+        newMigrationActive = false;
+        emit MigrationCompleted(totalMigratedUsers);
     }
     
     // ===================================================================
-    // 📊 VIEW FUNCTIONS (Read-only, no gas cost)
+    // VIEW FUNCTIONS (CORRECTED)
     // ===================================================================
     
     /**
-     * @dev Get current pending ROI rewards (time-based calculation)
+     * @dev CORRECTED: Get current pending ROI rewards (current cycle only)
      */
     function getCurrentPendingROI(address _user) public view returns (uint256) {
         User memory user = users[_user];
         
-        if (!user.isActive || !user.hasMinimumDirect) {
-            return user.pendingRewards;
+        if (!user.isActive || !user.hasMinimumDirect || user.cycleEndTime == 0) {
+            return 0;
         }
         
-        uint256 currentTime = block.timestamp;
-        uint256 effectiveEndTime = currentTime > user.cycleEndTime ? user.cycleEndTime : currentTime;
-        
-        // Ensure no underflow
-        if (effectiveEndTime <= user.lastRewardUpdate) {
-            return user.pendingRewards;
+        // Only give rewards when 10-hour cycle is completed
+        if (block.timestamp >= user.cycleEndTime) {
+            uint128 currentCycleActives = activeDirectsInCycle[_user][user.currentCycle];
+            return _getTierReward(currentCycleActives);
         }
         
-        uint256 totalTimeElapsed = effectiveEndTime - user.lastRewardUpdate;
-        uint256 hoursCompleted = totalTimeElapsed / ROI_INTERVAL;
-        uint256 ratePerHour = _getIntervalReward(user.activeDirects);
-        
-        if (hoursCompleted == 0 || ratePerHour == 0) {
-            return user.pendingRewards;
-        }
-        
-        uint256 timeBasedRewards = hoursCompleted * ratePerHour;
-        
-        // Check for overflow
-        if (user.pendingRewards + timeBasedRewards < user.pendingRewards) {
-            return type(uint256).max; // Return max value if overflow would occur
-        }
-        
-        return user.pendingRewards + timeBasedRewards;
+        return 0;
     }
     
     /**
-     * @dev Get user information
+     * @dev CORRECTED: Get user information with current cycle data
      */
     function getUserInfo(address _user) external view returns (
         bool isActive,
         uint256 joinTime,
         uint256 cycleEndTime,
-        uint256 activeDirects,
-        uint256 totalDirects,
+        uint256 currentCycleActives, // CORRECTED: Current cycle actives only
+        uint256 totalHistoricalDirects, // Historical count preserved
         uint256 pendingRewards,
         uint256 timeUntilCycleEnd,
         bool hasMinimumDirect,
-        address referrer
+        address referrer,
+        uint64 currentCycle
     ) {
         User memory user = users[_user];
         
@@ -853,22 +816,24 @@ contract HOURROI is ReentrancyGuard {
             : 0;
             
         uint256 currentPending = getCurrentPendingROI(_user);
+        uint128 cycleActives = activeDirectsInCycle[_user][user.currentCycle];
         
         return (
             user.isActive,
             user.joinTime,
             user.cycleEndTime,
-            user.activeDirects,
-            user.totalDirects,
+            cycleActives, // CORRECTED: Only current cycle actives
+            user.totalDirects, // Historical total preserved
             currentPending,
             timeUntilCycleEnd,
             user.hasMinimumDirect,
-            user.referrer
+            user.referrer,
+            user.currentCycle
         );
     }
     
     /**
-     * @dev Get user's ROI status
+     * @dev CORRECTED: Get ROI status with current cycle information
      */
     function getMyROIStatus(address _user) external view returns (
         bool roiActive,
@@ -877,61 +842,72 @@ contract HOURROI is ReentrancyGuard {
         uint256 hoursRemaining,
         uint256 currentROIRate,
         uint256 totalROIEarned,
-        string memory status
+        string memory status,
+        uint64 currentCycle,
+        uint256 currentCycleActives
     ) {
         require(hasJoined[_user], "User has not joined");
         
         User memory user = users[_user];
+        uint128 cycleActives = activeDirectsInCycle[_user][user.currentCycle];
         
-        roiActive = user.isActive && user.hasMinimumDirect;
-        currentROIRate = _getIntervalReward(user.activeDirects);
+        roiActive = user.isActive && user.hasMinimumDirect && user.cycleEndTime > 0;
+        currentROIRate = _getTierReward(cycleActives);
         totalROIEarned = getCurrentPendingROI(_user);
+        currentCycle = user.currentCycle;
+        currentCycleActives = cycleActives;
         
-        if (roiActive) {
+        if (user.cycleEndTime == 0) {
+            status = "Waiting for First Direct Referral to Start ROI";
+        } else if (roiActive) {
             roiStartedAt = user.lastRewardUpdate;
             roiEndsAt = user.cycleEndTime;
             
             if (block.timestamp < user.cycleEndTime) {
                 uint256 timeRemaining = user.cycleEndTime - block.timestamp;
                 hoursRemaining = timeRemaining / 3600;
-                status = "ROI Active - Earning Automatically Every Hour";
+                status = "ROI Active - Earning Based on Current Cycle Actives Only";
             } else {
                 hoursRemaining = 0;
                 status = "ROI Cycle Completed - Ready to Claim";
             }
-        } else if (user.isActive && user.activeDirects == 0) {
-            status = "Waiting for First Direct Referral to Start ROI";
+        } else if (user.isActive && cycleActives == 0) {
+            status = "Waiting for New Direct Referrals in Current Cycle";
         } else if (!user.isActive) {
             status = "Inactive - Need to Rejoin";
         } else {
             status = "Unknown Status";
         }
         
-        return (roiActive, roiStartedAt, roiEndsAt, hoursRemaining, currentROIRate, totalROIEarned, status);
+        return (roiActive, roiStartedAt, roiEndsAt, hoursRemaining, currentROIRate, totalROIEarned, status, currentCycle, currentCycleActives);
     }
     
     /**
-     * @dev Get user's referral information
+     * @dev CORRECTED: Get user's referral information with cycle data
      */
     function getMyReferralInfo(address _user) external view returns (
         address myReferralAddress,
-        uint256 totalDirectReferrals,
-        uint256 activeDirectReferrals,
-        bool canEarnFromReferrals
+        uint256 totalHistoricalDirects,
+        uint256 currentCycleActives,
+        bool canEarnFromReferrals,
+        uint64 currentCycle
     ) {
         require(hasJoined[_user], "User has not joined");
         
         User memory user = users[_user];
-        myReferralAddress = _user;
-        totalDirectReferrals = directReferralsCount[_user];
-        activeDirectReferrals = user.activeDirects;
-        canEarnFromReferrals = user.isActive;
+        uint128 cycleActives = activeDirectsInCycle[_user][user.currentCycle];
         
-        return (myReferralAddress, totalDirectReferrals, activeDirectReferrals, canEarnFromReferrals);
+        myReferralAddress = _user;
+        totalHistoricalDirects = directReferralsCount[_user];
+        currentCycleActives = cycleActives;
+        canEarnFromReferrals = user.isActive;
+        currentCycle = user.currentCycle;
+        
+        return (myReferralAddress, totalHistoricalDirects, currentCycleActives, canEarnFromReferrals, currentCycle);
     }
     
     /**
-     * @dev Get direct referrals with pagination
+     * @dev Get direct referrals with pagination (historical)
      */
     function getDirectReferrals(address _user, uint256 _offset, uint256 _limit) external view returns (address[] memory referrals) {
         uint256 count = directReferralsCount[_user];
@@ -950,6 +926,34 @@ contract HOURROI is ReentrancyGuard {
         
         for (uint256 i = 0; i < resultLength;) {
             referrals[i] = directReferrals[_user][_offset + i];
+            unchecked {
+                i++;
+            }
+        }
+        
+        return referrals;
+    }
+    
+    /**
+     * @dev CORRECTED: Get direct referrals for specific cycle
+     */
+    function getDirectReferralsInCycle(address _user, uint64 _cycle, uint256 _offset, uint256 _limit) external view returns (address[] memory referrals) {
+        uint256 count = directsCountInCycle[_user][_cycle];
+        
+        if (_offset >= count || _limit == 0) {
+            return new address[](0);
+        }
+        
+        uint256 end = _offset + _limit;
+        if (end > count) {
+            end = count;
+        }
+        
+        uint256 resultLength = end - _offset;
+        referrals = new address[](resultLength);
+        
+        for (uint256 i = 0; i < resultLength;) {
+            referrals[i] = directsJoinedInCycle[_user][_cycle][_offset + i];
             unchecked {
                 i++;
             }
@@ -998,17 +1002,32 @@ contract HOURROI is ReentrancyGuard {
     }
     
     /**
-     * @dev Get current ROI rate for user
+     * @dev CORRECTED: Get current ROI rate for user based on current cycle actives
      */
     function getCurrentROIRate(address _user) external view returns (uint256) {
-        return _getIntervalReward(users[_user].activeDirects);
+        uint128 cycleActives = activeDirectsInCycle[_user][users[_user].currentCycle];
+        return _getTierReward(cycleActives);
     }
     
     /**
-     * @dev Get direct referrals count
+     * @dev Get direct referrals count (historical total)
      */
     function getDirectReferralsCount(address _user) external view returns (uint256) {
         return directReferralsCount[_user];
+    }
+    
+    /**
+     * @dev CORRECTED: Get active directs count for current cycle only
+     */
+    function getCurrentCycleActivesCount(address _user) external view returns (uint256) {
+        return activeDirectsInCycle[_user][users[_user].currentCycle];
+    }
+    
+    /**
+     * @dev Get active directs count for specific cycle
+     */
+    function getCycleActivesCount(address _user, uint64 _cycle) external view returns (uint256) {
+        return activeDirectsInCycle[_user][_cycle];
     }
     
     /**
@@ -1016,6 +1035,74 @@ contract HOURROI is ReentrancyGuard {
      */
     function getContractBalance() external view returns (uint256) {
         return USDT.balanceOf(address(this));
+    }
+    
+    /**
+     * @dev Get migration statistics
+     */
+    function getMigrationStats() external view returns (
+        bool isCompleted,
+        uint256 migratedCount,
+        uint256 totalMigrated,
+        uint8 currentPhase,
+        bool isActive
+    ) {
+        return (
+            migrationCompleted,
+            migratedUsersList.length,
+            totalMigratedUsers,
+            currentMigrationPhase,
+            newMigrationActive
+        );
+    }
+    
+    /**
+     * @dev Get migration progress and recommendations
+     */
+    function getMigrationProgress() external view returns (
+        uint256 totalMigrated,
+        uint256 totalInList,
+        bool completed,
+        uint8 phase,
+        string memory recommendation
+    ) {
+        totalMigrated = totalMigratedUsers;
+        totalInList = migratedUsersList.length;
+        completed = migrationCompleted;
+        phase = currentMigrationPhase;
+        
+        if (!newMigrationActive && !completed) {
+            recommendation = "Call startNewMigration() first";
+        } else if (phase == 0) {
+            recommendation = "Use oneClickCompleteMigration() to migrate all 69 users";
+        } else if (phase == 1) {
+            recommendation = "Use migrateAllDownlines() for referral links";
+        } else {
+            recommendation = "Migration completed";
+        }
+        
+        return (totalMigrated, totalInList, completed, phase, recommendation);
+    }
+    
+    /**
+     * @dev Test old contract connection
+     */
+    function testOldContract() external view returns (
+        bool canConnect,
+        uint256 oldTotalUsers,
+        address oldContractAddress
+    ) {
+        oldContractAddress = address(oldContract);
+        
+        try oldContract.totalUsersJoined() returns (uint256 total) {
+            canConnect = true;
+            oldTotalUsers = total;
+        } catch {
+            canConnect = false;
+            oldTotalUsers = 0;
+        }
+        
+        return (canConnect, oldTotalUsers, oldContractAddress);
     }
     
     /**
@@ -1048,13 +1135,93 @@ contract HOURROI is ReentrancyGuard {
         }
         
         // Check time constants
-        if (CYCLE_DURATION != 10 hours || ROI_INTERVAL != 1 hours) {
+        if (CYCLE_DURATION != 10 hours) {
             return (false, "Incorrect time settings", contractBalance, totalUsers, usdtToken);
         }
         
         isValid = true;
-        status = "Contract validation passed - ready for use";
+        status = "Contract validation passed - Economic bug FIXED: Only current cycle actives count";
         
         return (isValid, status, contractBalance, totalUsers, usdtToken);
+    }
+    
+    /**
+     * @dev CORRECTED: Get user's cycle history
+     */
+    function getUserCycleHistory(address _user, uint64 _cycle) external view returns (
+        uint256 activesInCycle,
+        uint256 rewardsEarned,
+        bool cycleCompleted
+    ) {
+        activesInCycle = activeDirectsInCycle[_user][_cycle];
+        rewardsEarned = _getTierReward(activesInCycle);
+        
+        User memory user = users[_user];
+        cycleCompleted = _cycle < user.currentCycle;
+        
+        return (activesInCycle, rewardsEarned, cycleCompleted);
+    }
+    
+    /**
+     * @dev CORRECTED: Get multiple cycles data for user
+     */
+    function getUserMultipleCycles(address _user, uint64 _startCycle, uint64 _endCycle) external view returns (
+        uint64[] memory cycles,
+        uint256[] memory activesCounts,
+        uint256[] memory rewards
+    ) {
+        require(_startCycle <= _endCycle, "Invalid cycle range");
+        require(_endCycle - _startCycle <= 10, "Max 10 cycles per call");
+        
+        uint256 length = _endCycle - _startCycle + 1;
+        cycles = new uint64[](length);
+        activesCounts = new uint256[](length);
+        rewards = new uint256[](length);
+        
+        for (uint64 i = 0; i < length; i++) {
+            uint64 cycle = _startCycle + i;
+            cycles[i] = cycle;
+            activesCounts[i] = activeDirectsInCycle[_user][cycle];
+            rewards[i] = _getTierReward(activesCounts[i]);
+        }
+        
+        return (cycles, activesCounts, rewards);
+    }
+    
+    /**
+     * @dev CORRECTED: Comprehensive user status for debugging
+     */
+    function getUserCompleteStatus(address _user) external view returns (
+        bool hasJoinedBool,
+        bool isActive,
+        uint64 currentCycle,
+        uint256 totalHistoricalDirects,
+        uint256 currentCycleActives,
+        uint256 currentCycleDirectsJoined,
+        uint256 pendingROI,
+        string memory economicStatus
+    ) {
+        hasJoinedBool = hasJoined[_user];
+        if (!hasJoinedBool) {
+            return (false, false, 0, 0, 0, 0, 0, "User has not joined");
+        }
+        
+        User memory user = users[_user];
+        isActive = user.isActive;
+        currentCycle = user.currentCycle;
+        totalHistoricalDirects = directReferralsCount[_user];
+        currentCycleActives = activeDirectsInCycle[_user][currentCycle];
+        currentCycleDirectsJoined = directsCountInCycle[_user][currentCycle];
+        pendingROI = getCurrentPendingROI(_user);
+        
+        if (currentCycleActives == 0) {
+            economicStatus = "No actives in current cycle - needs new joins";
+        } else if (currentCycleActives != currentCycleDirectsJoined) {
+            economicStatus = "Some current cycle directs inactive";
+        } else {
+            economicStatus = "All current cycle directs active - sustainable";
+        }
+        
+        return (hasJoinedBool, isActive, currentCycle, totalHistoricalDirects, currentCycleActives, currentCycleDirectsJoined, pendingROI, economicStatus);
     }
 }

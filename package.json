@@ -6,9 +6,10 @@
   "scripts": {
     "start": "node ankr-bot.js",
     "dev": "nodemon ankr-bot.js",
-    "test": "node test.js",
+    "test": "node test-v11-connection.js",
     "test-connection": "node test-connection.js",
-    "test-v5": "node test-v5-connection.js",
+    "test-v11": "node test-v11-connection.js",
+    "test-v12": "node test-v12-connection.js",
     "pm2:start": "pm2 start ecosystem.config.js",
     "pm2:stop": "pm2 stop autopool-bot",
     "pm2:restart": "pm2 restart autopool-bot",
